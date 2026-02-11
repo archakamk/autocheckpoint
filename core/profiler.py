@@ -40,3 +40,27 @@ class MemoryProfiler:
             Dictionary mapping layer names to LayerStats objects
         """
         sample_input = sample_input.to(self.device)
+        if target is not None:
+            target = target.to(self.device)
+
+        self.layer_stats = {}
+
+        # TODO: Register hooks on all layers
+
+        # TODO: Run forward pass
+
+        # TODO: Run backward pass if target exists
+
+        # TODO: Remove hooks
+
+        # TODO: Return statistics
+    
+    def _register_hooks(self):
+        """Register forward and backward hooks on all modules"""
+        for name, module in self.model.named_modules():
+            if len(list(module.children())) > 0:
+                continue
+
+            self.layer_stats[name] = LayerStats(name)
+
+            # TODO: Register forward hook on this module
