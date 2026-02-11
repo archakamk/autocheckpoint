@@ -45,15 +45,24 @@ class MemoryProfiler:
 
         self.layer_stats = {}
 
-        # TODO: Register hooks on all layers
+        # Register hooks on all layers
+        self._register_hooks()
 
-        # TODO: Run forward pass
+        # Run forward pass
+        self.model.train()
+        output = self.model(sample_input)
 
-        # TODO: Run backward pass if target exists
+        # Run backward pass if target exists
+        if target is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(output, target)
+            loss.backward()
 
-        # TODO: Remove hooks
+        # Remove hooks
+        self._remove_hooks()
 
-        # TODO: Return statistics
+        # Return statistics
+        return self.layer_stats
     
     def _register_hooks(self):
         """Register forward and backward hooks on all modules"""
@@ -62,5 +71,62 @@ class MemoryProfiler:
                 continue
 
             self.layer_stats[name] = LayerStats(name)
+            self.layer_stats[name].num_parameters = sum(p.numel() for p in module.parameters())
 
-            # TODO: Register forward hook on this module
+            hook = self._make_forward_hook(name)
+            handle = module.register_forward_hook(hook)
+            self.hooks.append(handle)
+
+
+    def _make_forward_hook(self, name: str):
+        """Create forward hook for a specific layer"""
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                stats = self.layer_stats[name]
+                stats.activation_size = output.element_size() * output.nelement()    
+            elif isinstance(output, tuple):
+                total_size = 0
+                for item in output:
+                    if isinstance(item, torch.Tensor):
+                        total_size += item.element_size() * item.nelement()
+                stats.activation_size = total_size
+
+        return hook
+    
+    
+    def _remove_hooks(self):
+        """Remove all registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+
+        self.hooks = []
+
+    
+    def print_summary(self):
+        """Print a formatted summary of profiling results."""
+        print("\n" + "="*80)
+        print("Memory Profiling Summary")
+        print("="*80)
+
+        # Print column headers
+        print(f"{'Layer':<40} {'Activation Size':>20} {'Params':>15}")
+        print("-"*80)
+        
+        # Initialize totals
+        total_activation = 0
+        total_params = 0
+        
+        # Loop through stats and print each layer
+        for name, stats in self.layer_stats.items():
+            if stats.activation_size > 0:
+                print(f"{name:<40} {format_bytes(stats.activation_size):>20} {stats.num_parameters:>15,}")
+                total_activation += stats.activation_size
+                total_params += stats.num_parameters
+        
+        # Print separator
+        print("-"*80)
+        
+        # Print totals
+        print(f"{'TOTAL':<40} {format_bytes(total_activation):>20} {total_params:>15,}")
+        
+        print("="*80)
