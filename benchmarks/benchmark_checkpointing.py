@@ -178,6 +178,7 @@ def main():
     p.add_argument("--heads", type=int, default=16)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seq", type=int, default=1024)
+    p.add_argument("--vocab", type=int, default=8192)
     p.add_argument("--iters", type=int, default=10)
     args = p.parse_args()
 
@@ -187,13 +188,13 @@ def main():
 
     def make():
         torch.manual_seed(0)
-        return GPTLike(args.depth, args.dim, args.heads).to(device)
+        return GPTLike(args.depth, args.dim, args.heads, vocab=args.vocab).to(device)
 
-    idx = torch.randint(0, 50257, (args.batch, args.seq), device=device)
-    target = torch.randint(0, 50257, (args.batch, args.seq), device=device)
+    idx = torch.randint(0, args.vocab, (args.batch, args.seq), device=device)
+    target = torch.randint(0, args.vocab, (args.batch, args.seq), device=device)
     # Small-batch input just for profiling block sizes (never OOMs).
     pb = max(1, min(2, args.batch))
-    idx_small = torch.randint(0, 50257, (pb, args.seq), device=device)
+    idx_small = torch.randint(0, args.vocab, (pb, args.seq), device=device)
 
     results = []
 
