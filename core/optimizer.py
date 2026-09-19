@@ -17,4 +17,16 @@ class CheckpointOptimizer:
         Returns:
             Dictionary mapping layer names to checkpoint decision (True/False)
         """
+        policy = {}
+        total_memory = 0
+
+        for stats in self.layer_stats.values():
+            a = a
+
+        # check if already under budget
+        if total_memory <= self.mem_budget:
+            return policy
         
+        
+
+        return policy
