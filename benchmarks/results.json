@@ -1,0 +1,56 @@
+[
+  {
+    "strategy": "eager baseline",
+    "peak_gb": 8.650261504,
+    "step_ms": 2904.98671875,
+    "oom": false
+  },
+  {
+    "strategy": "eager checkpoint-all",
+    "peak_gb": 2.302936064,
+    "step_ms": 3858.924609375,
+    "oom": false
+  },
+  {
+    "strategy": "autockpt keep=0.75 (3 blk)",
+    "peak_gb": 7.038731264,
+    "step_ms": 3634.679296875,
+    "oom": false
+  },
+  {
+    "strategy": "autockpt keep=0.50 (6 blk)",
+    "peak_gb": 5.426152448,
+    "step_ms": 3895.976171875,
+    "oom": false
+  },
+  {
+    "strategy": "autockpt keep=0.25 (9 blk)",
+    "peak_gb": 3.813573632,
+    "step_ms": 4110.860546875,
+    "oom": false
+  },
+  {
+    "strategy": "compile default",
+    "peak_gb": 9.994109952,
+    "step_ms": 3559.522265625,
+    "oom": false
+  },
+  {
+    "strategy": "compile budget=0.7",
+    "peak_gb": 7.17625856,
+    "step_ms": 3595.548828125,
+    "oom": false
+  },
+  {
+    "strategy": "compile budget=0.5",
+    "peak_gb": 7.510688768,
+    "step_ms": 3722.547265625,
+    "oom": false
+  },
+  {
+    "strategy": "compile budget=0.3",
+    "peak_gb": 6.576882688,
+    "step_ms": 3983.1171875,
+    "oom": false
+  }
+]
