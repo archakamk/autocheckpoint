@@ -5,19 +5,26 @@ Both solve the same 0/1 knapsack "minimize recompute under a memory budget";
 this measures the gap between doing it at module granularity in eager mode and
 at operator granularity inside torch.compile. Run on a CUDA or ROCm GPU:
 
-    python benchmarks/benchmark_checkpointing.py --depth 12 --dim 1024 --batch 8 --seq 1024
+    python benchmarks/benchmark_checkpointing.py --depth 12 --dim 1024 --batch 16 --seq 1024
 
-Outputs a table of (peak memory, step time) points and, if matplotlib is
-present, a tradeoff scatter to benchmarks/tradeoff.png.
+Strategies that run out of memory are recorded as "OOM" instead of crashing the
+run -- a baseline that OOMs while a checkpointed config still trains is itself a
+headline result. Outputs a (peak memory, step time) table, results.json, and, if
+matplotlib is present, a tradeoff scatter to benchmarks/tradeoff.png.
 """
+import os
+# Reduce fragmentation so near-capacity runs are less likely to spuriously OOM.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import gc
 import json
 import time
 import contextlib
 import torch
 import torch.nn as nn
 
-import sys, os
+import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from core.profiler import LayerStats
 from core.optimizer import CheckpointOptimizer
@@ -57,9 +64,23 @@ class GPTLike(nn.Module):
         return self.head(x)
 
 
+# --------------------------- utilities ---------------------------
+def free(*objs):
+    for o in objs:
+        del o
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def is_oom(err: Exception) -> bool:
+    return isinstance(err, torch.cuda.OutOfMemoryError) or (
+        isinstance(err, RuntimeError) and "out of memory" in str(err).lower())
+
+
 # --------------------------- measurement ---------------------------
 def measure(model, idx, target, device, warmup=3, iters=10):
-    """Return (peak_bytes, mean_step_ms) for a full train step."""
+    """Return (peak_bytes, mean_step_ms), or (None, None) if the step OOMs."""
     opt = torch.optim.SGD(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
 
@@ -70,31 +91,40 @@ def measure(model, idx, target, device, warmup=3, iters=10):
         loss.backward()
         opt.step()
 
-    for _ in range(warmup):
-        step()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
+    try:
+        for _ in range(warmup):
             step()
-        end.record()
-        torch.cuda.synchronize()
-        return torch.cuda.max_memory_allocated(), start.elapsed_time(end) / iters
-    else:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                step()
+            end.record()
+            torch.cuda.synchronize()
+            return torch.cuda.max_memory_allocated(), start.elapsed_time(end) / iters
         t0 = time.perf_counter()
         for _ in range(iters):
             step()
         return 0, (time.perf_counter() - t0) * 1000 / iters
+    except Exception as e:  # noqa: BLE001
+        if is_oom(e):
+            free(opt)
+            return None, None
+        raise
 
 
 def profile_blocks(model, idx, device):
-    """Measure per-block activation bytes and forward time in one pass."""
-    stats, costs, order = {}, {}, []
+    """Measure per-block activation bytes and forward time in one pass.
+
+    `idx` should be a *small-batch* input so this never OOMs even when the full
+    batch would: the blocks are structurally identical, so the checkpoint policy
+    (which N blocks to wrap) is invariant to batch size.
+    """
+    stats, costs, ev = {}, {}, {}
     handles = []
-    ev = {}
 
     def pre(name):
         def hook(mod, inp):
@@ -114,15 +144,14 @@ def profile_blocks(model, idx, device):
                 ev[name][1].record()
             else:
                 costs[name] = (time.perf_counter() - ev[name]) * 1000
-            order.append(name)
         return hook
 
     for i, b in enumerate(model.blocks):
         name = f"blocks.{i}"
         handles.append(b.register_forward_pre_hook(pre(name)))
         handles.append(b.register_forward_hook(post(name)))
-
-    model(idx)
+    with torch.no_grad():
+        model(idx)
     if device.type == "cuda":
         torch.cuda.synchronize()
         for name in stats:
@@ -134,7 +163,6 @@ def profile_blocks(model, idx, device):
 
 # --------------------------- strategies ---------------------------
 def autocheckpoint_policy(block_bytes, block_costs, keep_fraction):
-    """Free (1 - keep_fraction) of total block activation, minimizing recompute."""
     ls = {n: LayerStats(n) for n in block_bytes}
     for n, b in block_bytes.items():
         ls[n].activation_size = b
@@ -148,15 +176,14 @@ def main():
     p.add_argument("--depth", type=int, default=12)
     p.add_argument("--dim", type=int, default=1024)
     p.add_argument("--heads", type=int, default=16)
-    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--batch", type=int, default=16)
     p.add_argument("--seq", type=int, default=1024)
     p.add_argument("--iters", type=int, default=10)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
-        print("WARNING: no GPU detected; memory numbers will be 0. "
-              "Run on a CUDA/ROCm GPU for meaningful results.\n")
+        print("WARNING: no GPU detected; memory numbers will be 0.\n")
 
     def make():
         torch.manual_seed(0)
@@ -164,59 +191,76 @@ def main():
 
     idx = torch.randint(0, 50257, (args.batch, args.seq), device=device)
     target = torch.randint(0, 50257, (args.batch, args.seq), device=device)
+    # Small-batch input just for profiling block sizes (never OOMs).
+    pb = max(1, min(2, args.batch))
+    idx_small = torch.randint(0, 50257, (pb, args.seq), device=device)
 
     results = []
 
-    def record(label, model):
+    def record(label, model_or_none):
+        if model_or_none is None:
+            print(f"  {label:<28} {'OOM':>6}")
+            results.append({"strategy": label, "peak_gb": None,
+                            "step_ms": None, "oom": True})
+            return
+        model = model_or_none
         mem, ms = measure(model, idx, target, device, iters=args.iters)
-        results.append({"strategy": label, "peak_gb": mem / 1e9, "step_ms": ms})
-        print(f"  {label:<28} {mem/1e9:6.2f} GB   {ms:8.1f} ms")
+        if mem is None:
+            print(f"  {label:<28} {'OOM':>6}")
+            results.append({"strategy": label, "peak_gb": None,
+                            "step_ms": None, "oom": True})
+        else:
+            print(f"  {label:<28} {mem/1e9:6.2f} GB   {ms:8.1f} ms")
+            results.append({"strategy": label, "peak_gb": mem / 1e9,
+                            "step_ms": ms, "oom": False})
+        free(model)
 
     print("=" * 64)
-    print("Eager strategies")
+    print(f"Config: depth={args.depth} dim={args.dim} batch={args.batch} "
+          f"seq={args.seq}")
     print("=" * 64)
-    # baseline
+    print("Eager strategies")
     record("eager baseline", make())
-    # checkpoint every block
+
     m = make()
     apply_checkpointing(m, {f"blocks.{i}": True for i in range(args.depth)})
     record("eager checkpoint-all", m)
-    # AutoCheckpoint curve
-    block_bytes, block_costs = profile_blocks(make(), idx, device)
+
+    # Profile block sizes at small batch, then apply the policy at full batch.
+    bstats, bcosts = profile_blocks(make(), idx_small, device)
     for f in (0.75, 0.50, 0.25):
         m = make()
-        pol = autocheckpoint_policy(block_bytes, block_costs, f)
+        pol = autocheckpoint_policy(bstats, bcosts, f)
         apply_checkpointing(m, pol)
-        n_ck = sum(pol.values())
-        record(f"autockpt keep={f:.2f} ({n_ck} blk)", m)
+        record(f"autockpt keep={f:.2f} ({sum(pol.values())} blk)", m)
 
     print("=" * 64)
     print("torch.compile strategies")
-    print("=" * 64)
     try:
         import torch._functorch.config as fconfig
         import torch._dynamo as dynamo
-        # default partitioner (runtime-optimized)
         dynamo.reset()
         record("compile default", torch.compile(make()))
-        # memory-budget sweep: 1.0 = save all, 0.0 = checkpoint all
         for budget in (0.7, 0.5, 0.3):
             dynamo.reset()
             fconfig.activation_memory_budget = budget
             record(f"compile budget={budget:.1f}", torch.compile(make()))
         fconfig.activation_memory_budget = 1.0
-    except Exception as e:  # noqa
+    except Exception as e:  # noqa: BLE001
         print(f"  torch.compile path skipped: {e}")
 
-    with open(os.path.join(os.path.dirname(__file__), "results.json"), "w") as f:
-        json.dump(results, f, indent=2)
+    out = os.path.join(os.path.dirname(__file__), "results.json")
+    with open(out, "w") as fh:
+        json.dump(results, fh, indent=2)
+    print(f"\nWrote {out}")
 
     with contextlib.suppress(Exception):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        eager = [r for r in results if "compile" not in r["strategy"]]
-        comp = [r for r in results if "compile" in r["strategy"]]
+        ok = [r for r in results if not r["oom"]]
+        eager = [r for r in ok if "compile" not in r["strategy"]]
+        comp = [r for r in ok if "compile" in r["strategy"]]
         for grp, mk, lbl in ((eager, "o", "AutoCheckpoint (eager)"),
                              (comp, "s", "torch.compile budget")):
             if grp:
@@ -225,7 +269,7 @@ def main():
         plt.xlabel("Peak memory (GB)"); plt.ylabel("Step time (ms)")
         plt.title("Memory vs. compute tradeoff"); plt.legend(); plt.grid(alpha=.3)
         plt.savefig(os.path.join(os.path.dirname(__file__), "tradeoff.png"), dpi=120)
-        print("\nSaved tradeoff.png")
+        print("Saved tradeoff.png")
 
 
 if __name__ == "__main__":
